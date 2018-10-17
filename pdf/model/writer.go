@@ -92,6 +92,46 @@ type PdfWriter struct {
 
 	optimizer         Optimizer
 	crossReferenceMap map[int]crossReference
+	appender          *PdfAppender
+}
+
+// newPdfWriterFromAppender initializes a new PdfWriter from existing PdfAppender.
+func newPdfWriterFromAppender(appender *PdfAppender) PdfWriter {
+	w := NewPdfWriter()
+	w.appender = appender
+
+	w.objectsMap = map[PdfObject]bool{}
+	w.objects = []PdfObject{}
+	w.pendingObjects = map[PdfObject]*PdfObjectDictionary{}
+
+	// PDF Version.  Can be changed if using more advanced features in PDF.
+	// By default it is set to 1.3.
+	w.majorVersion = 1
+	w.minorVersion = 3
+
+	w.infoObj = appender.infoObj
+	if w.infoObj == nil {
+		infoDict := MakeDict()
+		infoObj := PdfIndirectObject{}
+		infoObj.PdfObject = infoDict
+		w.infoObj = &infoObj
+	}
+	infoDict := w.infoObj.PdfObject.(*PdfObjectDictionary)
+	infoDict.Set("Producer", MakeString(getPdfProducer()))
+	infoDict.Set("Creator", MakeString(getPdfCreator()))
+	w.addObject(w.infoObj)
+
+	w.root = appender.root
+	w.addObject(w.root)
+
+	w.pages = appender.pages
+	w.addObject(w.pages)
+
+	w.catalog = appender.catalog
+
+	common.Log.Trace("Catalog %s", w.catalog)
+
+	return w
 }
 
 // NewPdfWriter initializes a new PdfWriter.
@@ -632,17 +672,21 @@ func (this *PdfWriter) writeObject(num int, obj PdfObject) {
 
 // Update all the object numbers prior to writing.
 func (this *PdfWriter) updateObjectNumbers() {
+	var offset int
+	if this.appender != nil {
+		offset = this.appender.greatestObjNum
+	}
 	// Update numbers
 	for idx, obj := range this.objects {
 		switch o := obj.(type) {
 		case *PdfIndirectObject:
-			o.ObjectNumber = int64(idx + 1)
+			o.ObjectNumber = int64(idx + 1 + offset)
 			o.GenerationNumber = 0
 		case *PdfObjectStream:
-			o.ObjectNumber = int64(idx + 1)
+			o.ObjectNumber = int64(idx + 1 + offset)
 			o.GenerationNumber = 0
 		case *PdfObjectStreams:
-			o.ObjectNumber = int64(idx + 1)
+			o.ObjectNumber = int64(idx + 1 + offset)
 			o.GenerationNumber = 0
 		}
 	}
@@ -790,9 +834,18 @@ func (this *PdfWriter) Write(writer io.Writer) error {
 		}
 	}
 
+	this.writePos = 0
+	if this.appender != nil {
+		var err error
+		this.writePos, err = this.appender.write(writer)
+		if err != nil {
+			return err
+		}
+	}
+
 	w := bufio.NewWriter(writer)
 	this.writer = w
-	this.writePos = 0
+
 	useCrossReferenceStream := this.majorVersion > 1 || (this.majorVersion == 1 && this.minorVersion > 4)
 	objectsInObjectStreams := make(map[PdfObject]bool)
 	if !useCrossReferenceStream {
@@ -813,8 +866,10 @@ func (this *PdfWriter) Write(writer io.Writer) error {
 		this.minorVersion = 5
 	}
 
-	this.writeString(fmt.Sprintf("%%PDF-%d.%d\n", this.majorVersion, this.minorVersion))
-	this.writeString("%âãÏÓ\n")
+	if this.appender == nil {
+		this.writeString(fmt.Sprintf("%%PDF-%d.%d\n", this.majorVersion, this.minorVersion))
+		this.writeString("%âãÏÓ\n")
+	}
 
 	this.updateObjectNumbers()
 
@@ -822,6 +877,25 @@ func (this *PdfWriter) Write(writer io.Writer) error {
 	common.Log.Trace("Writing %d obj", len(this.objects))
 	this.crossReferenceMap = make(map[int]crossReference)
 	this.crossReferenceMap[0] = crossReference{Type: 0, ObjectNumber: 0, Generation: 0xFFFF}
+	if this.appender != nil {
+		for idx, xref := range this.appender.xrefs {
+			if idx == 0 {
+				continue
+			}
+			if xref.XType == XrefTypeObjectStream {
+				cr := crossReference{Type: 2, ObjectNumber: xref.OsObjNumber, Index: xref.OsObjIndex}
+				this.crossReferenceMap[idx] = cr
+			}
+			if xref.XType == XrefTypeTableEntry {
+				cr := crossReference{Type: 1, ObjectNumber: xref.ObjectNumber, Offset: xref.Offset}
+				this.crossReferenceMap[idx] = cr
+			}
+		}
+	}
+	var offset int
+	if this.appender != nil {
+		offset = this.appender.greatestObjNum
+	}
 	for idx, obj := range this.objects {
 		if skip := objectsInObjectStreams[obj]; skip {
 			continue
@@ -831,24 +905,29 @@ func (this *PdfWriter) Write(writer io.Writer) error {
 		// Encrypt prior to writing.
 		// Encrypt dictionary should not be encrypted.
 		if this.crypter != nil && obj != this.encryptObj {
-			err := this.crypter.Encrypt(obj, int64(idx+1), 0)
+			err := this.crypter.Encrypt(obj, int64(idx+1+offset), 0)
 			if err != nil {
 				common.Log.Debug("ERROR: Failed encrypting (%s)", err)
 				return err
 			}
 		}
-		this.writeObject(idx+1, obj)
+		this.writeObject(idx+1+offset, obj)
 	}
 
 	xrefOffset := this.writePos
-
+	var maxIndex int
+	for idx := range this.crossReferenceMap {
+		if idx > maxIndex {
+			maxIndex = idx
+		}
+	}
 	if useCrossReferenceStream {
 
 		crossObjNumber := len(this.crossReferenceMap)
 		this.crossReferenceMap[crossObjNumber] = crossReference{Type: 1, ObjectNumber: crossObjNumber, Offset: xrefOffset}
 		crossReferenceData := bytes.NewBuffer(nil)
 
-		for idx := 0; idx < len(this.crossReferenceMap); idx++ {
+		for idx := 0; idx <= maxIndex; idx++ {
 			ref := this.crossReferenceMap[idx]
 			switch ref.Type {
 			case 0:
@@ -889,7 +968,7 @@ func (this *PdfWriter) Write(writer io.Writer) error {
 		this.writeString("xref\r\n")
 		outStr := fmt.Sprintf("%d %d\r\n", 0, len(this.crossReferenceMap))
 		this.writeString(outStr)
-		for idx := 0; idx < len(this.crossReferenceMap); idx++ {
+		for idx := 0; idx <= maxIndex; idx++ {
 			ref := this.crossReferenceMap[idx]
 			switch ref.Type {
 			case 0:
