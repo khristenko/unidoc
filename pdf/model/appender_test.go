@@ -51,6 +51,8 @@ func TestAppender1(t *testing.T) {
 		return
 	}
 
+	appender.MergePageWith(0, pdf2.PageList[0])
+
 	appender.AddPages(pdf2.PageList...)
 
 	appender.WriteFile("/tmp/appender_1.pdf")

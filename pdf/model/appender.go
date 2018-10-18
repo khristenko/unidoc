@@ -88,6 +88,75 @@ func NewPdfAppender(rs io.ReadSeeker) (*PdfAppender, error) {
 	return a, nil
 }
 
+// MergePageWith appends page content to source Pdf file page content
+func (a *PdfAppender) MergePageWith(pageNum int, page *PdfPage) error {
+	page = page.Duplicate()
+	pages, ok := a.pages.PdfObject.(*core.PdfObjectDictionary)
+	if !ok {
+		return fmt.Errorf("ERROR: Pages not found in the source document")
+	}
+	kidsObj := pages.Get("Kids")
+	kids, ok := kidsObj.(*core.PdfObjectArray)
+	if !ok {
+		return fmt.Errorf("ERROR: Kids not found in the source document")
+	}
+	srcPageObj := kids.Get(pageNum)
+	if srcPageObj == nil {
+		return fmt.Errorf("ERROR: Page %d not found in the source document", pageNum)
+	}
+	srcPageRef, ok := srcPageObj.(*core.PdfObjectReference)
+	if !ok {
+		return fmt.Errorf("ERROR: Page reference %d not found in the source document", pageNum)
+	}
+	srcPageObj, err := a.parser.LookupByNumber(int(srcPageRef.ObjectNumber))
+	if err != nil {
+		return err
+	}
+	srcPageInd, ok := srcPageObj.(*core.PdfIndirectObject)
+	if !ok {
+		return fmt.Errorf("ERROR: Page dictionary %d not found in the source document", pageNum)
+	}
+	srcPageDict, ok := srcPageInd.PdfObject.(*core.PdfObjectDictionary)
+	if !ok {
+		return fmt.Errorf("ERROR: Page dictionary %d not found in the source document", pageNum)
+	}
+
+	newPage := core.MakeDict()
+	newPage.Merge(srcPageDict)
+	if parentRef, ok := newPage.Get("Parent").(*core.PdfObjectReference); ok {
+		parent, err := a.parser.LookupByNumber(int(parentRef.ObjectNumber))
+		if err != nil {
+			return err
+		}
+		newPage.Set("Parent", parent)
+	}
+
+	srcContentsObj := srcPageDict.Get("Contents")
+	if srcContentsObj == nil {
+		return fmt.Errorf("ERROR: Page contents %s not found in the page", srcPageDict)
+	}
+	srcContents, ok := srcContentsObj.(*core.PdfObjectArray)
+	if !ok {
+		return fmt.Errorf("ERROR: Page contents %s not found in the page", srcPageDict)
+	}
+
+	contents, ok := page.Contents.(*core.PdfObjectArray)
+	if !ok {
+		contents = core.MakeArray(page.Contents)
+		page.Contents = contents
+	}
+
+	elements := srcContents.Elements()
+	elements = append(elements, contents.Elements()...)
+	newPage.Set("Contents", core.MakeArray(elements...))
+
+	obj := core.MakeIndirectObject(newPage)
+	a.newObjects = append(a.newObjects, obj)
+	kids.Set(pageNum, obj)
+	return nil
+}
+
+// AddPages adds pages to end of the source Pdf
 func (a *PdfAppender) AddPages(pages ...*PdfPage) {
 	for _, page := range pages {
 		a.newPages = append(a.newPages, page)
@@ -114,6 +183,10 @@ func (a *PdfAppender) WriteFile(outputPath string) error {
 	}
 
 	w := newPdfWriterFromAppender(a)
+	for _, obj := range a.newObjects {
+		w.addObject(obj)
+	}
+
 	for _, page := range a.newPages {
 		w.AddPage(page)
 	}
