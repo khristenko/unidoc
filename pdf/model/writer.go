@@ -124,8 +124,9 @@ func newPdfWriterFromAppender(appender *PdfAppender) PdfWriter {
 	w.root = appender.root
 	w.addObject(w.root)
 
-	w.pages = appender.pages
+	w.pages = appender.ppages
 	w.addObject(w.pages)
+	//appender.kids
 
 	w.catalog = appender.catalog
 
@@ -984,7 +985,7 @@ func (this *PdfWriter) Write(writer io.Writer) error {
 		trailer := MakeDict()
 		trailer.Set("Info", this.infoObj)
 		trailer.Set("Root", this.root)
-		trailer.Set("Size", MakeInteger(int64(len(this.objects)+1)))
+		trailer.Set("Size", MakeInteger(int64(len(this.crossReferenceMap))))
 		// If encrypted!
 		if this.crypter != nil {
 			trailer.Set("Encrypt", this.encryptObj)
