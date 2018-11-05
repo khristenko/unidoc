@@ -6,6 +6,8 @@
 package model
 
 import (
+	"bytes"
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"io"
@@ -43,6 +45,8 @@ type PdfAppender struct {
 	//
 	resourcesRenameMap    map[string]string
 	objectToObjectCopyMap map[core.PdfObject]core.PdfObject
+	acroForm              *PdfAcroForm
+	signatureDict         *pdfSignDictionary
 }
 
 // getPageResourcesByName returns a list of the page resources by name and contained PdfObjectDictionary.
@@ -75,7 +79,6 @@ func getPageResourcesByName(parser *core.PdfParser, page *core.PdfObjectDictiona
 	return nil
 }
 
-// NewPdfAppender creates a new Pdf appender from a Pdf reader.
 func NewPdfAppender(reader *PdfReader) (*PdfAppender, error) {
 	a := &PdfAppender{}
 	a.pagesDict = make(map[int]*core.PdfObjectDictionary)
@@ -85,7 +88,7 @@ func NewPdfAppender(reader *PdfReader) (*PdfAppender, error) {
 	a.srcResources = make(map[string]struct{})
 	a.srcIndirectObjects = make(map[core.PdfObject]core.PdfObjectReference)
 	a.objectToObjectCopyMap = make(map[core.PdfObject]core.PdfObject)
-
+	a.acroForm = reader.AcroForm
 	a.rs = reader.rs
 	a.Reader = reader
 	a.parser = a.Reader.parser
@@ -113,7 +116,7 @@ func NewPdfAppender(reader *PdfReader) (*PdfAppender, error) {
 	a.root = oc.(*core.PdfIndirectObject)
 	a.catalog, ok = a.root.PdfObject.(*core.PdfObjectDictionary)
 	if !ok {
-		common.Log.Debug("ERROR: Missing catalog: (root %q) (trailer %s)", oc, *trailer)
+		common.Log.Debug("ERROR: Missing catalog: (root %q) (trailer %s)", oc, trailer)
 		return nil, errors.New("Missing catalog")
 	}
 
@@ -258,7 +261,7 @@ func (a *PdfAppender) addNewObjects(obj core.PdfObject) {
 	}
 }
 
-// getNewName returns a new unique name from the given name.
+// getNewName returns a new unique name from the given name
 func (a *PdfAppender) getNewName(name string) string {
 	for i := 1; true; i++ {
 		newName := name + strconv.Itoa(i)
@@ -321,6 +324,41 @@ func (a *PdfAppender) renameResources(page *core.PdfObjectDictionary) error {
 	return nil
 }
 
+func (a *PdfAppender) makeSignDict() *pdfSignDictionary {
+	signValue := &pdfSignDictionary{PdfObjectDictionary: *core.MakeDict()}
+	signValue.Set("Type", core.MakeName("Sig"))
+	signValue.Set("Filter", core.MakeName("Adobe.PPKLite"))
+	signValue.Set("SubFilter", core.MakeName("adbe.x509.rsa_sha1"))
+	reference := core.MakeDict()
+	reference.Set("Type", core.MakeName("SigRef"))
+	reference.Set("TransformMethod", core.MakeName("FieldMDP"))
+	//reference.Set("Data", ) // ref to Catalog
+	reference.Set("DigestMethod", core.MakeName("SHA1"))
+	params := core.MakeDict()
+	params.Set("Type", core.MakeName("TransformParams"))
+	params.Set("Action", core.MakeName("All"))
+	params.Set("V", core.MakeName("1.2"))
+	reference.Set("TransformParams", params)
+	signValue.Set("Reference", reference)
+	//core.MakeStringFromBytes()
+	// key
+	signValue.Set("Contents", core.MakeHexString("ff"))
+	return signValue
+}
+
+// CreateSignatureField creates a digital
+func (a *PdfAppender) CreateSignatureField() (*PdfField, *PdfAnnotationWidget) {
+	f := NewPdfField()
+	signValue := a.makeSignDict()
+	f.V = core.MakeIndirectObject(signValue) // makeSignatureValue
+	f.FT = core.MakeName("Sig")
+	f.T = core.MakeString("Signature1") // check number
+
+	annot := NewPdfAnnotationWidget()
+	//annot.
+	return f, annot
+}
+
 func (a *PdfAppender) copyPage(page *PdfPage) (*core.PdfIndirectObject, *core.PdfObjectDictionary) {
 	pageObj := page.ToPdfObject()
 	pageIndirect := pageObj.(*core.PdfIndirectObject)
@@ -346,7 +384,6 @@ func (a *PdfAppender) copyPage(page *PdfPage) (*core.PdfIndirectObject, *core.Pd
 	return copyPageIndirect, copyPageDict
 }
 
-// ReplacePage replaces the original page to a new page.
 func (a *PdfAppender) ReplacePage(pageNum int, page *PdfPage) error {
 	_, ok := a.pagesDict[pageNum]
 	if !ok {
@@ -360,6 +397,23 @@ func (a *PdfAppender) ReplacePage(pageNum int, page *PdfPage) error {
 	a.addNewObjects(pageIndirect)
 	a.kids.Set(pageNum, pageIndirect)
 	return nil
+}
+
+func (a *PdfAppender) RemovePage(pageNum int) error {
+	/*
+		_, ok := a.pagesDict[pageNum]
+		if !ok {
+			return fmt.Errorf("ERROR: Page dictionary %d not found in the source document", pageNum)
+		}
+
+		page.ToPdfObject()
+		a.pagesDict[pageNum] = page.pageDict
+		ind := page.GetPageAsIndirectObject()
+		a.addNewObjects(ind)
+		a.kids.Set(pageNum, ind)
+		return nil
+	*/
+	return fmt.Errorf("RemovePage unimplementd")
 }
 
 // MergePageWith appends page content to source Pdf file page content.
@@ -533,42 +587,64 @@ func (a *PdfAppender) MergePageWith(pageNum int, page *PdfPage) error {
 func (a *PdfAppender) AddPages(pages ...*PdfPage) {
 	for _, page := range pages {
 		pageIndirect, pageDict := a.copyPage(page)
+		//copyPageObj := copyObject(page.ToPdfObject(), a.objectToObjectCopyMap)
+		//pageIndirect := copyPageObj.(*core.PdfIndirectObject)
+		//pageDict := pageIndirect.PdfObject.(*core.PdfObjectDictionary)
 		pageDict.Set("Parent", a.ppages)
+		//pageCopy := page.Duplicate()
 		a.renameResources(pageDict)
 		index := len(a.pagesDict)
+		//pageCopy.ToPdfObject()
+		//pageDict := copyObject(pageCopy.pageDict, a.objectToObjectCopyMap).(*core.PdfObjectDictionary)
 		a.pagesDict[index] = pageDict
 		a.newPagesDict[index] = pageIndirect
 		a.addNewObjects(pageIndirect)
 		a.kids.Append(pageIndirect)
 		a.pages.Set("Count", core.MakeInteger(int64(index+1)))
+		//a.newPages = append(a.newPages, pageCopy)
 	}
 	return
 }
 
-// Write writes the Appender output to io.Writer.
-func (a *PdfAppender) Write(writer io.Writer) error {
-	if _, err := a.rs.Seek(0, io.SeekStart); err != nil {
-		return err
+// pdfSignDictionary is needed because of the digital checksum calculates after a new file creation and writes as a value into PdfDictionary in the existing file.
+type pdfSignDictionary struct {
+	core.PdfObjectDictionary
+	fileOffset      int64
+	contentsOffset  int
+	byteRangeOffset int
+}
+
+// DefaultWriteString outputs the object as it is to be written to file.
+func (d *pdfSignDictionary) DefaultWriteString() string {
+	d.contentsOffset = 0
+	outStr := "<<"
+	for _, k := range d.Keys() {
+		v := d.Get(k)
+		switch k {
+		case "ByteRange":
+			outStr += k.DefaultWriteString()
+			outStr += "                       "
+			d.byteRangeOffset = len(outStr)
+			outStr += v.DefaultWriteString()
+		case "Contents":
+			outStr += k.DefaultWriteString()
+			outStr += " "
+			d.contentsOffset = len(outStr)
+			outStr += v.DefaultWriteString()
+		default:
+			outStr += k.DefaultWriteString()
+			outStr += " "
+			outStr += v.DefaultWriteString()
+		}
 	}
-	offset, err := io.Copy(writer, a.rs)
-	if err != nil {
-		return err
-	}
-	if len(a.newObjects) == 0 {
-		return nil
-	}
-	w := newPdfWriterFromAppender(a)
-	w.writeOffset = offset
-	w.ObjNumOffset = a.greatestObjNum
-	w.appendMode = true
-	w.appendToXrefs = a.xrefs
-	for _, obj := range a.newObjects {
-		w.addObject(obj)
-	}
-	if err := w.Write(writer); err != nil {
-		return err
-	}
-	return err
+	outStr += ">>"
+	return outStr
+}
+
+func (a *PdfAppender) ReplaceForm(form *PdfAcroForm) {
+	obj := copyObject(form.ToPdfObject(), a.objectToObjectCopyMap)
+	a.catalog.Set("AcroForm", obj)
+	a.addNewObjects(obj)
 }
 
 // WriteToFile writes the Appender output to file specified by path.
@@ -578,7 +654,41 @@ func (a *PdfAppender) WriteToFile(outputPath string) error {
 		return err
 	}
 	defer fWrite.Close()
-	return a.Write(fWrite)
+
+	if _, err := a.rs.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	hashSha1 := sha1.New() // if needed
+	reader := io.TeeReader(a.rs, hashSha1)
+	offset, err := io.Copy(fWrite, reader)
+	if err != nil {
+		return err
+	}
+	if len(a.newObjects) == 0 {
+		return nil
+	}
+	/*
+		sd := &pdfSignDictionary{}
+		sdInd := core.MakeIndirectObject(sd)
+		a.newObjects = append(a.newObjects, sdInd)
+	*/
+	w := newPdfWriterFromAppender(a)
+	w.writeOffset = offset
+	w.ObjNumOffset = a.greatestObjNum
+	w.appendMode = true
+	w.appendToXrefs = a.xrefs
+	for _, obj := range a.newObjects {
+		w.addObject(obj)
+	}
+	//w.SetForms(a.acroForm)
+	buffer := bytes.NewBuffer(nil)
+	if err := w.Write(buffer); err != nil {
+		return err
+	}
+	_, err = io.Copy(fWrite, buffer)
+	//fmt.Printf("%x", sd.fileOffset)
+	return err
 }
 
 func traceObject(parser *core.PdfParser, obj core.PdfObject) (core.PdfObject, error) {
@@ -602,23 +712,32 @@ func getDict(obj core.PdfObject, err error) (*core.PdfObjectDictionary, error) {
 // newPdfWriterFromAppender initializes a new PdfWriter from existing PdfAppender.
 func newPdfWriterFromAppender(appender *PdfAppender) PdfWriter {
 	w := NewPdfWriter()
+
 	w.objectsMap = map[core.PdfObject]bool{}
 	w.objects = []core.PdfObject{}
 	w.pendingObjects = map[core.PdfObject]*core.PdfObjectDictionary{}
+
 	// PDF Version.  Can be changed if using more advanced features in PDF.
 	// By default it is set to 1.3.
 	w.majorVersion = 1
 	w.minorVersion = 3
+
 	infoDict := core.MakeDict()
 	infoDict.Set("Producer", core.MakeString(getPdfProducer()))
 	infoDict.Set("Creator", core.MakeString(getPdfCreator()))
 	w.infoObj = core.MakeIndirectObject(infoDict)
 	w.addObject(w.infoObj)
+
 	w.root = appender.root
 	w.addObject(w.root)
+
 	w.pages = appender.ppages
 	w.addObject(w.pages)
+	//appender.kids
+
 	w.catalog = appender.catalog
+
 	common.Log.Trace("Catalog %s", w.catalog)
+
 	return w
 }

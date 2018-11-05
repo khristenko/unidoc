@@ -181,6 +181,14 @@ func copyObject(obj PdfObject, objectToObjectCopyMap map[PdfObject]PdfObject) Pd
 		objectToObjectCopyMap[obj] = newObj
 		newObj.PdfObjectDictionary = copyObject(t.PdfObjectDictionary, objectToObjectCopyMap).(*PdfObjectDictionary)
 		return newObj
+	case *pdfSignDictionary:
+		newObj := &pdfSignDictionary{PdfObjectDictionary: *MakeDict()}
+		objectToObjectCopyMap[obj] = newObj
+		for _, key := range t.Keys() {
+			val := t.Get(key)
+			newObj.Set(key, copyObject(val, objectToObjectCopyMap))
+		}
+		return newObj
 	case *PdfObjectDictionary:
 		newObj := MakeDict()
 		objectToObjectCopyMap[obj] = newObj
@@ -572,6 +580,9 @@ func (this *PdfWriter) writeObject(num int, obj PdfObject) {
 	if pobj, isIndirect := obj.(*PdfIndirectObject); isIndirect {
 		this.crossReferenceMap[num] = crossReference{Type: 1, Offset: this.writePos, Generation: pobj.GenerationNumber}
 		outStr := fmt.Sprintf("%d 0 obj\n", num)
+		if sDict, ok := pobj.PdfObject.(*pdfSignDictionary); ok {
+			sDict.fileOffset = this.writePos + int64(len(outStr))
+		}
 		outStr += pobj.PdfObject.DefaultWriteString()
 		outStr += "\nendobj\n"
 		this.writeString(outStr)
