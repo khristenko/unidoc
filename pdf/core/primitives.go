@@ -942,6 +942,15 @@ func (streams *PdfObjectStreams) Append(objects ...PdfObject) {
 	}
 }
 
+// Set sets the PdfObject at index i of the streams. An error is returned if the index is outside bounds.
+func (streams *PdfObjectStreams) Set(i int, obj PdfObject) error {
+	if i < 0 || i >= len(streams.vec) {
+		return errors.New("Outside bounds")
+	}
+	streams.vec[i] = obj
+	return nil
+}
+
 // Elements returns a slice of the PdfObject elements in the array.
 // Preferred over accessing the array directly as type may be changed in future major versions (v3).
 func (streams *PdfObjectStreams) Elements() []PdfObject {
